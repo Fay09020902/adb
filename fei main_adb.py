@@ -1,4 +1,14 @@
 # Databricks notebook source
+# MAGIC %run /Users/fyj121322@gmail.com/Movie_final_project/Operations_ADB
+
+# COMMAND ----------
+
+from pyspark.sql.functions import *
+from delta import DeltaTable
+from datetime import datetime
+
+# COMMAND ----------
+
 username = 'yinjiao_fei'
 GenresDimPath = f"/dbacademyfinal/{username}/movie_databricks_final/Genres/"
 MoviePipelinePath = f"/dbacademyfinal/{username}/movie_databricks_final/classic/"
@@ -12,63 +22,38 @@ goldPath = MoviePipelinePath + "gold/"
 
 # COMMAND ----------
 
-from pyspark.sql.functions import *
-from delta import DeltaTable
-from datetime import datetime
-
-# COMMAND ----------
-
 raw_directory = 'dbfs:/FileStore/Final project'
 
 #ingest raw data
 
 
-raw_df = spark.read.option("multiLine", 'true').format('json').load(dbutils.fs.ls(raw_directory)[0].path).select(explode('movie'))
+raw_directory = 'dbfs:/FileStore/Final project'
 
-movie_file_paths = [file.path for file in dbutils.fs.ls(raw_directory) if 'movie' in file.path]
+#ingest raw data
+ingest_movie_data(raw_directory)
 
-for file in range(1,len(movie_file_paths)):
-    raw_df = raw_df.union(spark.read.option("multiLine", 'true').format('json').load(movie_file_paths[file]).select(explode('movie')))
-
-file_name = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
-raw_df.write.format('json').save(rawPath + file_name)
-
-# COMMAND ----------
 
 #raw to bronze
-raw_df = spark.read.format('json').load(rawPath + file_name)
-transformed_raw = raw_df.select(
-  col('col').alias('movie'),
-  current_timestamp().alias("ingesttime"),
-  lit('new').alias('status'),
-  current_timestamp().cast("date").alias("p_ingestdate"),
-  lit(raw_directory).alias('source'))
-raw_to_Bronze_Writer = transformed_raw.write.format('delta').mode('append').partitionBy('ingesttime')
+
+#read raw
+raw_df = read_batch_raw()
+transformed_raw_df = transform_raw(raw_df)
+raw_to_Bronze_Writer = batch_writer(transformed_dataframe=transformed_raw_df, partition_column="ingesttime")
 raw_to_Bronze_Writer.save(bronzePath)
 
 dbutils.fs.rm(rawPath, recurse=True)
 
-# COMMAND ----------
-
 #bronze to silver 
 dbutils.fs.rm(silverPath, recurse=True)
-bronze_df = spark.read.format('delta').load(bronzePath).filter(col('status') == lit('new'))
-transformed_bronze_df = bronze_df.dropDuplicates(["movie"]).select("movie.*", 'movie')
-silver_clean_df = transformed_bronze_df.withColumn('RunTime', when(col("RunTime") < 0, -col('RunTime')).otherwise(col('RunTime'))).withColumn('Budget', when(col('Budget') < 10*6, 10*6).otherwise(col('Budget'))).drop(col('genres'))
+bronze_df = read_batch_bronze()
 
-bronzetoSilverWriter = silver_clean_df.drop(col('movie')).write.format('delta').mode('append')
+silver_clean_df = transform_bronze(bronze_df)
+
+#write to silver path
+bronzetoSilverWriter = batch_writer(transformed_dataframe=silver_clean_df, partition_column="CreatedDate", exclude_columns = ['movie'])
 bronzetoSilverWriter.save(silverPath)
 
-
-# COMMAND ----------
-
-bronzeTable = DeltaTable.forPath(spark, bronzePath)
-dataframeAugmented = silver_clean_df.withColumn("status", lit('loaded'))
-( bronzeTable.alias('bronze')
-.merge(dataframeAugmented.alias('dataframe'),'bronze.movie = dataframe.movie')
-.whenMatchedUpdate(set={"status": "dataframe.status"})
-.execute()
-)
+update_bronze_table_status(bronzePath, silver_clean_df, "loaded")
 
 # COMMAND ----------
 
